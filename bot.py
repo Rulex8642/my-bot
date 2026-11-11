@@ -1,20 +1,23 @@
 """Личный Telegram-бот: скачивание видео, конвертер, утренняя сводка."""
 import asyncio
+import io
 import logging
 import math
 import os
 import re
 import shutil
 import tempfile
+import time as time_module
 from datetime import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import feedparser
 import httpx
+import qrcode
 import yt_dlp
 from dotenv import load_dotenv
-from PIL import Image
+from PIL import Image, ImageOps
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler,
@@ -140,6 +143,21 @@ async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str)
             out = tmp / "result.pdf"
             Image.open(src).convert("RGB").save(out)
             await update.effective_message.reply_document(open(out, "rb"))
+        elif mode == "sticker":
+            img = ImageOps.exif_transpose(Image.open(src)).convert("RGBA")
+            scale = 512 / max(img.size)               # одна сторона ровно 512 px
+            img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+                             Image.LANCZOS)
+            out = tmp / "sticker.webp"
+            for quality in (90, 75, 60, 40):          # стикер должен быть меньше 512 КБ
+                img.save(out, "WEBP", quality=quality)
+                if out.stat().st_size < 500 * 1024:
+                    break
+            await update.effective_message.reply_sticker(open(out, "rb"))
+        elif mode == "qrread":
+            import cv2                                # тяжёлая библиотека, грузим только здесь
+            text, _, _ = cv2.QRCodeDetector().detectAndDecode(cv2.imread(str(src)))
+            await update.effective_message.reply_text(text or "QR-код на картинке не найден.")
         elif mode == "mp3":
             out = tmp / "result.mp3"
             await ffmpeg("-i", str(src), "-vn", "-acodec", "libmp3lame", "-q:a", "2", str(out))
@@ -159,11 +177,37 @@ async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str)
 
 
 # ---------- утренняя сводка ----------
+async def _geocode(c: httpx.AsyncClient) -> dict:
+    geo = (await c.get("https://geocoding-api.open-meteo.com/v1/search",
+                       params={"name": CITY, "count": 1, "language": "ru"})).json()
+    return geo["results"][0]
+
+
+async def get_forecast(hours=(2, 4, 6)) -> str:
+    """Погода сейчас и через 2, 4, 6 часов."""
+    async with httpx.AsyncClient(timeout=15) as c:
+        place = await _geocode(c)
+        w = (await c.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": place["latitude"], "longitude": place["longitude"],
+            "current": "temperature_2m,weather_code",
+            "hourly": "temperature_2m,precipitation_probability,weather_code",
+            "timezone": "auto", "forecast_days": 2,
+        })).json()
+    cur, h = w["current"], w["hourly"]
+    i = h["time"].index(cur["time"][:13] + ":00")          # индекс текущего часа
+    lines = [f"🌍 {place['name']}",
+             f"Сейчас: {cur['temperature_2m']:.0f} °C, {WEATHER_CODES.get(cur['weather_code'], '')}"]
+    for d in hours:
+        j = i + d
+        rain = h["precipitation_probability"][j] or 0
+        lines.append(f"Через {d} ч ({h['time'][j][11:16]}): {h['temperature_2m'][j]:.0f} °C, "
+                     f"{WEATHER_CODES.get(h['weather_code'][j], '')}, осадки {rain}%")
+    return "\n".join(lines)
+
+
 async def get_weather() -> str:
     async with httpx.AsyncClient(timeout=15) as c:
-        geo = (await c.get("https://geocoding-api.open-meteo.com/v1/search",
-                           params={"name": CITY, "count": 1, "language": "ru"})).json()
-        place = geo["results"][0]
+        place = await _geocode(c)
         w = (await c.get("https://api.open-meteo.com/v1/forecast", params={
             "latitude": place["latitude"], "longitude": place["longitude"],
             "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,weathercode",
@@ -197,19 +241,102 @@ async def send_morning(context: ContextTypes.DEFAULT_TYPE):
                                    parse_mode="HTML", disable_web_page_preview=True)
 
 
+# ---------- оповещение о дожде ----------
+RAIN_MM = 0.1                    # осадков за 15 минут, с которых считаем, что дождь начался
+RAIN_COOLDOWN = 90 * 60          # не чаще одного оповещения в полтора часа
+
+
+async def check_rain(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в 10 минут смотрит прогноз на 15-минутных интервалах."""
+    data = context.bot_data
+    if not data.get("rain_on", True):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            place = await _geocode(c)
+            w = (await c.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": place["latitude"], "longitude": place["longitude"],
+                "current": "temperature_2m",
+                "minutely_15": "precipitation,snowfall",
+                "timezone": "auto", "forecast_days": 2,
+            })).json()
+        m = w["minutely_15"]
+        now = w["current"]["time"]
+        idx = max((i for i, t in enumerate(m["time"]) if t <= now), default=0)
+        precip = [p or 0 for p in m["precipitation"]]
+        snow = [s or 0 for s in m["snowfall"]]
+    except Exception:
+        log.exception("rain check failed")
+        return
+
+    window = precip[idx: idx + 9]                 # текущий момент + следующие 2 часа
+    if window[0] >= RAIN_MM or all(p < RAIN_MM for p in window):
+        data["rain_alerted"] = False              # дождь уже идёт или не ожидается: готовимся к следующему
+        return
+    soon = [k for k in (1, 2) if precip[idx + k] >= RAIN_MM]   # через 15 и 30 минут
+    if not soon or data.get("rain_alerted"):
+        return
+    if time_module.time() - data.get("rain_last", 0) < RAIN_COOLDOWN:
+        return
+    snowing = any(snow[idx + k] > 0 for k in soon)
+    what = "пойдёт снег ❄️" if snowing else "пойдёт дождь ☔"
+    await context.bot.send_message(
+        OWNER_ID, f"Примерно через {soon[0] * 15} мин в {place['name']} {what}")
+    data["rain_alerted"] = True
+    data["rain_last"] = time_module.time()
+
+
+async def rain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    on = not context.bot_data.get("rain_on", True)
+    context.bot_data["rain_on"] = on
+    await update.message.reply_text(
+        "☔ Оповещения о дожде включены." if on else "Оповещения о дожде выключены.")
+
+
+# ---------- QR-коды ----------
+async def qr_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = (update.message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("Напишите так: /qr https://example.com")
+        return
+    try:
+        qr = qrcode.QRCode(box_size=12, border=4)
+        qr.add_data(parts[1].strip())
+        qr.make(fit=True)
+        buf = io.BytesIO()
+        qr.make_image(fill_color="black", back_color="white").save(buf, "PNG")
+        buf.seek(0)
+        await update.message.reply_photo(buf)
+    except Exception:
+        log.exception("qr failed")
+        await update.message.reply_text("Не получилось: текст слишком длинный для QR-кода.")
+
+
 # ---------- хендлеры ----------
 HELP = (
     "Что я умею:\n"
     "• Ссылка TikTok / Reels — пришлю видео без водяного знака\n"
     "• Ссылка YouTube — видео или MP3 на выбор\n"
     "• Видео-файл — сжать или вытащить MP3\n"
-    "• Картинка — сделать PDF\n"
+    "• Картинка — PDF, стикер или чтение QR-кода\n"
+    "• /qr текст или ссылка — сделать QR-код\n"
+    "• /weather — погода сейчас и через 2, 4 и 6 часов\n"
+    "• /rain — включить или выключить оповещения о дожде (включены по умолчанию)\n"
     f"• Каждое утро в {MORNING_TIME} — погода и новости (/morning — прямо сейчас)"
 )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP)
+
+
+async def weather_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = await get_forecast()
+    except Exception:
+        log.exception("forecast failed")
+        text = "Не удалось получить прогноз, попробуйте позже."
+    await update.message.reply_text(text)
 
 
 async def morning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -241,10 +368,10 @@ async def on_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons = [("📉 Сжать", "conv:compress"), ("🎵 В MP3", "conv:mp3")]
     elif msg.photo:
         context.user_data["fid"] = msg.photo[-1].file_id
-        buttons = [("📄 В PDF", "conv:pdf")]
+        buttons = [("📄 В PDF", "conv:pdf"), ("🎭 Стикер", "conv:sticker"), ("🔲 Читать QR", "conv:qrread")]
     elif msg.document and (msg.document.mime_type or "").startswith("image/"):
         context.user_data["fid"] = msg.document.file_id
-        buttons = [("📄 В PDF", "conv:pdf")]
+        buttons = [("📄 В PDF", "conv:pdf"), ("🎭 Стикер", "conv:sticker"), ("🔲 Читать QR", "conv:qrread")]
     else:
         await msg.reply_text("Такой формат пока не поддерживаю.")
         return
@@ -276,11 +403,15 @@ def main():
     owner = filters.User(OWNER_ID)
     app.add_handler(CommandHandler(["start", "help"], start, owner))
     app.add_handler(CommandHandler("morning", morning_cmd, owner))
+    app.add_handler(CommandHandler("weather", weather_cmd, owner))
+    app.add_handler(CommandHandler("qr", qr_cmd, owner))
+    app.add_handler(CommandHandler("rain", rain_cmd, owner))
     app.add_handler(MessageHandler(owner & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(owner & (filters.VIDEO | filters.PHOTO | filters.Document.ALL), on_media))
     app.add_handler(CallbackQueryHandler(on_button))
     hh, mm = map(int, MORNING_TIME.split(":"))
     app.job_queue.run_daily(send_morning, time(hh, mm, tzinfo=TZ))
+    app.job_queue.run_repeating(check_rain, interval=600, first=30)   # проверка дождя каждые 10 минут
     app.run_polling()
 
 
